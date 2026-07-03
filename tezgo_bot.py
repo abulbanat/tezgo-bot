@@ -205,6 +205,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/id — reply with this chat's numeric id (used to configure DRIVERS_CHAT_ID)."""
+    chat = update.effective_chat
+    kind = chat.type if chat else "unknown"
+    await update.message.reply_text(
+        "🆔 <b>Chat ID</b>\n"
+        f"<code>{chat.id}</code>\n\n"
+        f"Type: {kind}\n"
+        "Set this value as <b>DRIVERS_CHAT_ID</b> in Railway to receive orders here.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Web App data handler
 # --------------------------------------------------------------------------- #
@@ -397,6 +410,7 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("id", id_command))
 
     # Web App data arrives as a special message; match it first.
     application.add_handler(
