@@ -168,22 +168,65 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def register_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard that asks the user to share their (Telegram-verified) phone."""
+    button = KeyboardButton(text="📱 Telefon raqamni ulashish", request_contact=True)
+    return ReplyKeyboardMarkup(
+        [[button]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Ro'yxatdan o'tish uchun raqamingizni ulashing",
+    )
+
+
+def get_user(context: ContextTypes.DEFAULT_TYPE, uid) -> dict:
+    """Return the stored (registered) customer profile, or None."""
+    return context.bot_data.setdefault("users", {}).get(uid)
+
+
 # --------------------------------------------------------------------------- #
 # Command handlers
 # --------------------------------------------------------------------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — greet the user and show the WebApp button."""
+    """/start — register (share phone) on first use, then show the WebApp button."""
     user = update.effective_user
-    name = user.first_name if user else "there"
-    text = (
-        f"👋 Hi {name}, welcome to <b>TezGo</b>!\n"
-        f"🚕 Salom! TezGo orqali tez va oson taksi buyurtma qiling.\n\n"
-        "Tap the button below to open the app, choose your pickup and "
-        "destination, and confirm your ride."
-    )
+    name = user.first_name if user else "do'stim"
+    if not get_user(context, user.id):
+        await update.message.reply_text(
+            f"👋 Salom {name}, <b>TezGo</b>'ga xush kelibsiz!\n\n"
+            "Buyurtma berishdan oldin bir marta ro'yxatdan o'ting — pastdagi tugma orqali "
+            "telefon raqamingizni ulashing. Raqam Telegram tomonidan tasdiqlanadi, "
+            "shuning uchun bu haydovchi bilan xavfsiz aloqa uchun ishlatiladi.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=register_keyboard(),
+        )
+        return
     await update.message.reply_text(
-        text,
+        f"👋 {name}, tayyor! Pastdagi <b>🚕 Order a ride</b> tugmasi orqali buyurtma bering.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def register_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Store the user's Telegram-verified phone when they share their contact."""
+    user = update.effective_user
+    contact = update.message.contact
+    # Only accept the user's OWN contact (Telegram sets user_id on self-shared contacts).
+    if contact.user_id is not None and contact.user_id != user.id:
+        await update.message.reply_text(
+            "⚠️ Iltimos, boshqa odamning emas, o'zingizning raqamingizni ulashing.",
+            reply_markup=register_keyboard(),
+        )
+        return
+    context.bot_data.setdefault("users", {})[user.id] = {
+        "phone": contact.phone_number,
+        "username": ("@" + user.username) if user.username else None,
+        "name": user.full_name,
+    }
+    await update.message.reply_text(
+        "✅ Ro'yxatdan o'tdingiz! Endi <b>🚕 Order a ride</b> tugmasi orqali buyurtma bering.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(),
     )
@@ -258,33 +301,50 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # 3. Build the order record.
-    order_id = generate_order_id()
+    # 3. Require registration (verified phone) before accepting an order.
     user = update.effective_user
+    reg = get_user(context, user.id) if user else None
+    if not reg:
+        await message.reply_text(
+            "📱 Buyurtma berishdan oldin ro'yxatdan o'ting — pastdagi tugma orqali "
+            "telefon raqamingizni ulashing.",
+            reply_markup=register_keyboard(),
+        )
+        return
+
+    # 4. Build the order record.
+    order_id = generate_order_id()
     order["order_id"] = order_id
-    order["customer_id"] = user.id if user else None
-    order["customer_name"] = user.full_name if user else "Customer"
+    order["customer_id"] = user.id
+    order["customer_name"] = user.full_name
+    order["customer_phone"] = reg.get("phone")
+    order["customer_username"] = reg.get("username")
     order["created_at"] = datetime.now(timezone.utc).isoformat()
 
     class_label = CAR_CLASSES[order["class"]]
 
-    # 4. Confirm to the customer.
+    # 5. Confirm to the customer (with a cancel button they control).
     confirmation = (
-        f"✅ <b>Order confirmed!</b>\n"
-        f"Order ID: <code>{order_id}</code>\n\n"
-        f"📍 <b>Pickup:</b> {he(order['pickup']['address'])}\n"
-        f"🏁 <b>Destination:</b> {he(order['destination']['address'])}\n"
-        f"🚘 <b>Car class:</b> {class_label}\n"
-        f"📏 <b>Distance:</b> {order['distance_km']:.1f} km\n"
-        f"⏱ <b>Duration:</b> ~{int(round(order['duration_min']))} min\n"
-        f"💰 <b>Fare:</b> {format_som(order['fare_som'])} so'm\n\n"
-        "We're finding a driver for you now…"
+        f"✅ <b>Buyurtma qabul qilindi!</b>\n"
+        f"Raqam: <code>{order_id}</code>\n\n"
+        f"📍 <b>Qayerdan:</b> {he(order['pickup']['address'])}\n"
+        f"🏁 <b>Qayerga:</b> {he(order['destination']['address'])}\n"
+        f"🚘 <b>Sinf:</b> {class_label}\n"
+        f"📏 <b>Masofa:</b> {order['distance_km']:.1f} km\n"
+        f"⏱ <b>Vaqt:</b> ~{int(round(order['duration_min']))} daq\n"
+        f"💰 <b>Narx:</b> {format_som(order['fare_som'])} so'm\n\n"
+        "🔎 Haydovchi qidirilmoqda…"
     )
-    await message.reply_text(
+    cust_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Buyurtmani bekor qilish", callback_data=f"custcancel:{order_id}")]]
+    )
+    sent = await message.reply_text(
         confirmation,
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(),
+        reply_markup=cust_markup,
     )
+    order["customer_chat_id"] = sent.chat_id
+    order["customer_message_id"] = sent.message_id
 
     # 5. Forward to the drivers' group (if configured).
     order["status"] = "pending"
@@ -333,6 +393,12 @@ def render_order_text(order: dict) -> str:
     ]
     if order.get("driver_name"):
         lines.append(f"\n🧑‍✈️ Haydovchi: <b>{he(order['driver_name'])}</b>")
+    # Show the customer's contact to drivers once the order is taken (so they can call).
+    if order.get("status") not in ("pending", None) and order.get("customer_phone"):
+        contact = he(order["customer_phone"])
+        if order.get("customer_username"):
+            contact += f" ({he(order['customer_username'])})"
+        lines.append(f"📞 Mijoz aloqasi: {contact}")
     return "\n".join(lines)
 
 
@@ -525,6 +591,46 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("Re-forward failed for %s: %s", order_id, exc)
 
 
+async def customer_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The customer cancels their own order (before completion)."""
+    query = update.callback_query
+    try:
+        _, order_id = query.data.split(":", 1)
+    except ValueError:
+        await query.answer()
+        return
+    order = context.bot_data.get("orders", {}).get(order_id)
+    if not order:
+        await query.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    if query.from_user.id != order.get("customer_id"):
+        await query.answer("Bu buyurtma sizniki emas.", show_alert=True)
+        return
+    if order.get("status") in ("completed", "cancelled"):
+        await query.answer("Bu buyurtmani bekor qilib bo'lmaydi.", show_alert=True)
+        return
+
+    had_driver = order.get("driver_id")
+    order["status"] = "cancelled"
+    order["cancelled_by"] = "customer"
+    await query.answer("Buyurtmangiz bekor qilindi.")
+    try:
+        await query.edit_message_text(f"❌ Buyurtmangiz <code>{order_id}</code> bekor qilindi.",
+                                       parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001
+        pass
+    await refresh_group_message(context, order)
+    if DRIVERS_CHAT_ID and had_driver:
+        try:
+            await context.bot.send_message(
+                chat_id=DRIVERS_CHAT_ID,
+                text=f"⚠️ <code>{order_id}</code> — mijoz buyurtmani bekor qildi.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def rate_driver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Customer rates the driver 1–5 after completion."""
     query = update.callback_query
@@ -606,6 +712,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("drivers", drivers_stats))
 
+    # Registration: user shares their (Telegram-verified) phone number.
+    application.add_handler(MessageHandler(filters.CONTACT, register_contact))
+
     # Web App data arrives as a special message; match it first.
     application.add_handler(
         MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_data)
@@ -615,6 +724,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(accept_order, pattern=r"^accept:"))
     application.add_handler(CallbackQueryHandler(stage_order, pattern=r"^stage:"))
     application.add_handler(CallbackQueryHandler(cancel_order, pattern=r"^cancel:"))
+    application.add_handler(CallbackQueryHandler(customer_cancel, pattern=r"^custcancel:"))
     application.add_handler(CallbackQueryHandler(rate_driver, pattern=r"^rate:"))
 
     # Any other plain text -> gentle nudge.
