@@ -286,105 +286,297 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     # 5. Forward to the drivers' group (if configured).
+    order["status"] = "pending"
+    order["driver_id"] = None
+    order["driver_name"] = None
     if not DRIVERS_CHAT_ID:
         logger.info("Order %s created (no DRIVERS_CHAT_ID set; not forwarded).", order_id)
         return
 
-    # Stash the order so the "Accept" callback can look it up later.
     context.bot_data.setdefault("orders", {})[order_id] = order
-
-    driver_text = (
-        f"🆕 <b>New TezGo order</b> — <code>{order_id}</code>\n\n"
-        f"👤 Customer: {order['customer_name']}\n"
-        f"📍 <b>Pickup:</b> {order['pickup']['address']}\n"
-        f"   <a href=\"{maps_link(order['pickup']['lat'], order['pickup']['lon'])}\">Open in Maps</a>\n"
-        f"🏁 <b>Destination:</b> {order['destination']['address']}\n"
-        f"   <a href=\"{maps_link(order['destination']['lat'], order['destination']['lon'])}\">Open in Maps</a>\n"
-        f"🚘 Class: {class_label}\n"
-        f"📏 {order['distance_km']:.1f} km · ⏱ ~{int(round(order['duration_min']))} min\n"
-        f"💰 Fare: {format_som(order['fare_som'])} so'm"
-    )
-    accept_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Accept", callback_data=f"accept:{order_id}")]]
-    )
-
     try:
-        # Text summary with the Accept button.
-        await context.bot.send_message(
-            chat_id=DRIVERS_CHAT_ID,
-            text=driver_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=accept_markup,
-            disable_web_page_preview=True,
-        )
-        # Pin the two points on the map as live location messages.
-        await context.bot.send_location(
-            chat_id=DRIVERS_CHAT_ID,
-            latitude=order["pickup"]["lat"],
-            longitude=order["pickup"]["lon"],
-        )
-        await context.bot.send_location(
-            chat_id=DRIVERS_CHAT_ID,
-            latitude=order["destination"]["lat"],
-            longitude=order["destination"]["lon"],
-        )
+        await forward_order_to_group(context, order)
     except Exception as exc:  # noqa: BLE001 — log and continue; don't crash the bot.
         logger.exception("Failed to forward order %s to drivers chat: %s", order_id, exc)
 
 
 # --------------------------------------------------------------------------- #
-# Callback (driver accepts an order)
+# Order lifecycle: accept -> enroute -> arrived -> completed (+ cancel, rating)
 # --------------------------------------------------------------------------- #
 
-async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a driver tapping the 'Accept' button in the drivers' group."""
-    query = update.callback_query
-    await query.answer()
+STATUS_LABELS = {
+    "pending": "🟡 Kutilmoqda",
+    "accepted": "🟢 Qabul qilindi",
+    "enroute": "🚗 Yo'lda",
+    "arrived": "📍 Yetib keldi",
+    "completed": "✅ Yakunlandi",
+    "cancelled": "❌ Bekor qilindi",
+}
 
+
+def render_order_text(order: dict) -> str:
+    """Render the drivers'-group message body for the current order state."""
+    class_label = CAR_CLASSES.get(order["class"], order["class"])
+    lines = [
+        f"🆕 <b>TezGo buyurtma</b> — <code>{order['order_id']}</code>",
+        f"Holat: <b>{STATUS_LABELS.get(order.get('status', 'pending'))}</b>",
+        "",
+        f"👤 Mijoz: {order['customer_name']}",
+        f"📍 <b>Qayerdan:</b> {order['pickup']['address']}",
+        f"   <a href=\"{maps_link(order['pickup']['lat'], order['pickup']['lon'])}\">Xaritada ochish</a>",
+        f"🏁 <b>Qayerga:</b> {order['destination']['address']}",
+        f"   <a href=\"{maps_link(order['destination']['lat'], order['destination']['lon'])}\">Xaritada ochish</a>",
+        f"🚘 Sinf: {class_label}",
+        f"📏 {order['distance_km']:.1f} km · ⏱ ~{int(round(order['duration_min']))} daq",
+        f"💰 Narx: {format_som(order['fare_som'])} so'm",
+    ]
+    if order.get("driver_name"):
+        lines.append(f"\n🧑‍✈️ Haydovchi: <b>{order['driver_name']}</b>")
+    return "\n".join(lines)
+
+
+def order_markup(order: dict):
+    """Inline buttons that match the current status (driver-side controls)."""
+    st = order.get("status", "pending")
+    oid = order["order_id"]
+    if st == "pending":
+        rows = [[InlineKeyboardButton("✅ Qabul qilish", callback_data=f"accept:{oid}")]]
+    elif st == "accepted":
+        rows = [[InlineKeyboardButton("🚗 Yo'ldaman", callback_data=f"stage:{oid}:enroute")],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel:{oid}")]]
+    elif st == "enroute":
+        rows = [[InlineKeyboardButton("📍 Yetib keldim", callback_data=f"stage:{oid}:arrived")],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel:{oid}")]]
+    elif st == "arrived":
+        rows = [[InlineKeyboardButton("✅ Yakunladim", callback_data=f"stage:{oid}:completed")],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel:{oid}")]]
+    else:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+async def forward_order_to_group(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
+    """Post (or re-post) an order to the drivers' group and remember its message."""
+    msg = await context.bot.send_message(
+        chat_id=DRIVERS_CHAT_ID,
+        text=render_order_text(order),
+        parse_mode=ParseMode.HTML,
+        reply_markup=order_markup(order),
+        disable_web_page_preview=True,
+    )
+    order["group_chat_id"] = msg.chat_id
+    order["group_message_id"] = msg.message_id
+    try:
+        await context.bot.send_location(chat_id=DRIVERS_CHAT_ID,
+                                        latitude=order["pickup"]["lat"], longitude=order["pickup"]["lon"])
+        await context.bot.send_location(chat_id=DRIVERS_CHAT_ID,
+                                        latitude=order["destination"]["lat"], longitude=order["destination"]["lon"])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def refresh_group_message(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
+    """Edit the group message in place to reflect the current status/buttons."""
+    try:
+        await context.bot.edit_message_text(
+            chat_id=order.get("group_chat_id"),
+            message_id=order.get("group_message_id"),
+            text=render_order_text(order),
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_markup(order),
+            disable_web_page_preview=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def notify_customer(context: ContextTypes.DEFAULT_TYPE, order: dict, text: str) -> None:
+    cid = order.get("customer_id")
+    if not cid:
+        return
+    try:
+        await context.bot.send_message(chat_id=cid, text=text, parse_mode=ParseMode.HTML)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("notify_customer failed for %s: %s", cid, exc)
+
+
+def _driver_stats(context, driver) -> dict:
+    stats = context.bot_data.setdefault("driver_stats", {}).setdefault(
+        driver.id, {"name": "", "accepted": 0, "completed": 0, "cancelled": 0, "ratings": []}
+    )
+    stats["name"] = ("@" + driver.username) if driver.username else driver.full_name
+    return stats
+
+
+async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A driver taps 'Qabul qilish'. First-come locks the order to that driver."""
+    query = update.callback_query
     try:
         _, order_id = query.data.split(":", 1)
     except ValueError:
+        await query.answer()
         return
-
-    orders = context.bot_data.get("orders", {})
-    order = orders.get(order_id)
+    order = context.bot_data.get("orders", {}).get(order_id)
+    if not order:
+        await query.answer("Buyurtma topilmadi yoki eskirgan.", show_alert=True)
+        return
+    if order.get("status") != "pending" or order.get("driver_id"):
+        await query.answer(f"Allaqachon qabul qilingan ({order.get('driver_name') or '—'}).", show_alert=True)
+        return
 
     driver = query.from_user
-    driver_name = driver.full_name if driver else "A driver"
+    order["status"] = "accepted"
+    order["driver_id"] = driver.id
+    order["driver_name"] = ("@" + driver.username) if driver.username else driver.full_name
+    stats = _driver_stats(context, driver)
+    stats["accepted"] += 1
 
-    # Update the drivers' group message so nobody else grabs the same order.
+    await query.answer("Buyurtma sizga biriktirildi ✅")
+    await refresh_group_message(context, order)
+    await notify_customer(
+        context, order,
+        f"🟢 Buyurtmangiz <code>{order_id}</code> qabul qilindi!\n"
+        f"Haydovchi: <b>{order['driver_name']}</b> tez orada bog'lanadi.",
+    )
+
+
+async def stage_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The assigned driver advances the ride: enroute -> arrived -> completed."""
+    query = update.callback_query
     try:
-        await query.edit_message_text(
-            text=f"{query.message.text_html}\n\n🚗 <b>Accepted by {driver_name}</b>",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:  # noqa: BLE001 — editing is best-effort.
-        logger.info("Could not edit drivers' message for %s.", order_id)
-
+        _, order_id, stage = query.data.split(":", 2)
+    except ValueError:
+        await query.answer()
+        return
+    order = context.bot_data.get("orders", {}).get(order_id)
     if not order:
-        logger.info("Accept for unknown/expired order %s.", order_id)
+        await query.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    driver = query.from_user
+    if order.get("driver_id") != driver.id:
+        await query.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
         return
 
-    # Simulate assignment: notify the customer that a driver is coming.
-    customer_id = order.get("customer_id")
-    if customer_id:
+    order["status"] = stage
+    await query.answer("Yangilandi ✅")
+    await refresh_group_message(context, order)
+
+    if stage == "enroute":
+        await notify_customer(context, order, f"🚗 Haydovchi <b>{order['driver_name']}</b> yo'lda — sizga kelmoqda.")
+    elif stage == "arrived":
+        await notify_customer(context, order, f"📍 Haydovchi <b>{order['driver_name']}</b> yetib keldi. Iltimos, chiqing.")
+    elif stage == "completed":
+        stats = context.bot_data.get("driver_stats", {}).get(driver.id)
+        if stats:
+            stats["completed"] += 1
+        cid = order.get("customer_id")
+        if cid:
+            rate_rows = [[InlineKeyboardButton("⭐" * n + f"  {n}", callback_data=f"rate:{order_id}:{n}")]
+                         for n in range(5, 0, -1)]
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(f"✅ Safar yakunlandi. Rahmat!\n"
+                          f"Haydovchi <b>{order['driver_name']}</b>ni baholang:"),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(rate_rows),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The assigned driver cancels — the order is re-opened to the group."""
+    query = update.callback_query
+    try:
+        _, order_id = query.data.split(":", 1)
+    except ValueError:
+        await query.answer()
+        return
+    order = context.bot_data.get("orders", {}).get(order_id)
+    if not order:
+        await query.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    driver = query.from_user
+    if order.get("driver_id") != driver.id:
+        await query.answer("Bu buyurtma sizga tegishli emas.", show_alert=True)
+        return
+
+    await query.answer("Buyurtma bekor qilindi.")
+    stats = context.bot_data.get("driver_stats", {}).get(driver.id)
+    if stats:
+        stats["cancelled"] += 1
+
+    order["status"] = "cancelled"
+    await refresh_group_message(context, order)
+    await notify_customer(
+        context, order,
+        f"⚠️ Buyurtmangiz <code>{order_id}</code> haydovchi tomonidan bekor qilindi. "
+        "Yangi haydovchi qidirilmoqda…",
+    )
+    # Re-open as a fresh pending order (new message in the group).
+    order["status"] = "pending"
+    order["driver_id"] = None
+    order["driver_name"] = None
+    try:
+        await forward_order_to_group(context, order)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Re-forward failed for %s: %s", order_id, exc)
+
+
+async def rate_driver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Customer rates the driver 1–5 after completion."""
+    query = update.callback_query
+    try:
+        _, order_id, n = query.data.split(":", 2)
+        n = int(n)
+    except ValueError:
+        await query.answer()
+        return
+    order = context.bot_data.get("orders", {}).get(order_id)
+    if not order:
+        await query.answer("Baholash muddati o'tgan.", show_alert=True)
+        return
+    if query.from_user.id != order.get("customer_id"):
+        await query.answer("Faqat mijoz baholaydi.", show_alert=True)
+        return
+
+    order["rating"] = n
+    stats = context.bot_data.get("driver_stats", {}).get(order.get("driver_id"))
+    if stats:
+        stats["ratings"].append(n)
+    await query.answer("Rahmat! Bahoyingiz qabul qilindi.")
+    try:
+        await query.edit_message_text(f"⭐ Bahoyingiz: {'⭐' * n} ({n}/5)\nRahmat, fikringiz uchun!")
+    except Exception:  # noqa: BLE001
+        pass
+    if DRIVERS_CHAT_ID:
+        avg = (sum(stats["ratings"]) / len(stats["ratings"])) if stats and stats["ratings"] else n
         try:
             await context.bot.send_message(
-                chat_id=customer_id,
-                text=(
-                    f"🚗 Good news! A driver has accepted your order "
-                    f"<code>{order_id}</code> and is on the way to your pickup point.\n"
-                    "Rahmat! Haydovchingiz yo'lda."
-                ),
+                chat_id=DRIVERS_CHAT_ID,
+                text=(f"⭐ <code>{order_id}</code> — {order.get('driver_name') or ''} "
+                      f"baholandi: {n}/5 (o'rtacha {avg:.1f})"),
                 parse_mode=ParseMode.HTML,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not notify customer %s: %s", customer_id, exc)
+        except Exception:  # noqa: BLE001
+            pass
 
-    # Mark as assigned (kept simple for now).
-    order["status"] = "assigned"
-    order["driver_id"] = driver.id if driver else None
+
+async def drivers_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/drivers — show a simple leaderboard of driver activity and ratings."""
+    stats = context.bot_data.get("driver_stats", {})
+    if not stats:
+        await update.message.reply_text("Hozircha haydovchi statistikasi yo'q.")
+        return
+    lines = ["<b>🏁 Haydovchilar statistikasi</b>", ""]
+    for _did, s in sorted(stats.items(), key=lambda kv: kv[1]["completed"], reverse=True):
+        r = s["ratings"]
+        avg = f"{sum(r) / len(r):.1f}⭐" if r else "—"
+        lines.append(
+            f"{s['name']}: ✅ {s['completed']} · qabul {s['accepted']} · bekor {s['cancelled']} · {avg}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,14 +603,18 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("drivers", drivers_stats))
 
     # Web App data arrives as a special message; match it first.
     application.add_handler(
         MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_data)
     )
 
-    # Driver accepting an order.
+    # Order lifecycle callbacks.
     application.add_handler(CallbackQueryHandler(accept_order, pattern=r"^accept:"))
+    application.add_handler(CallbackQueryHandler(stage_order, pattern=r"^stage:"))
+    application.add_handler(CallbackQueryHandler(cancel_order, pattern=r"^cancel:"))
+    application.add_handler(CallbackQueryHandler(rate_driver, pattern=r"^rate:"))
 
     # Any other plain text -> gentle nudge.
     application.add_handler(
