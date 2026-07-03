@@ -28,8 +28,8 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, ConversationHandler,
-    MessageHandler, filters,
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -37,6 +37,7 @@ log = logging.getLogger("tezgo-driver")
 
 TOKEN = os.environ.get("DRIVER_BOT_TOKEN", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+BACKEND_URL = os.environ.get("BACKEND_URL", "").strip().rstrip("/")  # to accept orders
 
 # Conversation states
 (PHONE, NAME, LIC_F, LIC_B, TECH_F, TECH_B, TAXI, CAR_F, CAR_B, CAR_L, CAR_R,
@@ -268,6 +269,50 @@ async def offline_cmd(update, context): await _set_online(update, context, False
 
 
 # --------------------------------------------------------------------------- #
+# Accept an order (driver taps the inline button on a dispatched order)
+# --------------------------------------------------------------------------- #
+async def accept_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import httpx
+    q = update.callback_query
+    try:
+        _, code = q.data.split(":", 1)
+    except ValueError:
+        await q.answer()
+        return
+    drv = await get_driver(q.from_user.id)
+    if not drv or drv["status"] != "approved":
+        await q.answer("Faqat tasdiqlangan haydovchilar uchun.", show_alert=True)
+        return
+    if not BACKEND_URL:
+        await q.answer("Backend sozlanmagan.", show_alert=True)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{BACKEND_URL}/api/orders/{code}/accept",
+                             json={"driver_telegram_id": q.from_user.id})
+            j = r.json()
+    except Exception:  # noqa: BLE001
+        await q.answer("Xatolik. Qayta urinib ko'ring.", show_alert=True)
+        return
+    if not j.get("ok"):
+        msg = {"taken": "Buyurtma allaqachon olingan.",
+               "notfound": "Buyurtma topilmadi.",
+               "not_driver": "Siz tasdiqlangan haydovchi emassiz."}.get(j.get("error"), "Olib bo'lmadi.")
+        await q.answer(msg, show_alert=True)
+        try:
+            await q.edit_message_reply_markup(None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    await q.answer("Qabul qilindi ✅")
+    try:
+        await q.edit_message_text((q.message.text or "") +
+                                  "\n\n✅ Siz qabul qildingiz. Mijozga xabar berildi.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Wiring
 # --------------------------------------------------------------------------- #
 async def post_init(app: Application):
@@ -309,6 +354,7 @@ def build() -> Application:
     app.add_handler(selfie_conv)
     app.add_handler(CommandHandler("online", online_cmd))
     app.add_handler(CommandHandler("offline", offline_cmd))
+    app.add_handler(CallbackQueryHandler(accept_cb, pattern=r"^accept:"))
     return app
 
 

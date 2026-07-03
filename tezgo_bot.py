@@ -57,6 +57,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://corestacklabs.uz/tezgo-webapp.html").strip()
 DRIVERS_CHAT_ID = os.environ.get("DRIVERS_CHAT_ID", "").strip()
+BACKEND_URL = os.environ.get("BACKEND_URL", "").strip().rstrip("/")  # dispatch orders to online drivers
 
 # Human-readable labels for the car classes defined in the payload contract.
 CAR_CLASSES = {
@@ -149,6 +150,31 @@ def validate_order(data: dict) -> dict:
         "duration_min": duration_min,
         "fare_som": fare_som,
     }
+
+
+async def post_order_to_backend(user, order) -> None:
+    """Send the confirmed order to the backend, which dispatches it to online drivers."""
+    if not BACKEND_URL:
+        return
+    try:
+        import httpx  # bundled with python-telegram-bot[all]
+        payload = {
+            "customer": {
+                "telegram_id": user.id if user else None,
+                "name": user.full_name if user else None,
+                "username": ("@" + user.username) if (user and user.username) else None,
+            },
+            "pickup": order["pickup"],
+            "destination": order["destination"],
+            "class": order["class"],
+            "distance_km": order["distance_km"],
+            "duration_min": order["duration_min"],
+            "fare_som": order["fare_som"],
+        }
+        async with httpx.AsyncClient(timeout=15) as c:
+            await c.post(f"{BACKEND_URL}/api/orders", json=payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("post_order_to_backend failed: %s", exc)
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -345,6 +371,9 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     order["customer_chat_id"] = sent.chat_id
     order["customer_message_id"] = sent.message_id
+
+    # 4b. Send the order to the backend, which dispatches it to online drivers.
+    await post_order_to_backend(user, order)
 
     # 5. Forward to the drivers' group (if configured).
     order["status"] = "pending"
