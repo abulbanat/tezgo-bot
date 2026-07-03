@@ -30,6 +30,7 @@ import os
 import random
 import string
 from datetime import datetime, timezone
+from html import escape as he  # escape user/geocoded text for ParseMode.HTML
 
 from telegram import (
     InlineKeyboardButton,
@@ -271,8 +272,8 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     confirmation = (
         f"✅ <b>Order confirmed!</b>\n"
         f"Order ID: <code>{order_id}</code>\n\n"
-        f"📍 <b>Pickup:</b> {order['pickup']['address']}\n"
-        f"🏁 <b>Destination:</b> {order['destination']['address']}\n"
+        f"📍 <b>Pickup:</b> {he(order['pickup']['address'])}\n"
+        f"🏁 <b>Destination:</b> {he(order['destination']['address'])}\n"
         f"🚘 <b>Car class:</b> {class_label}\n"
         f"📏 <b>Distance:</b> {order['distance_km']:.1f} km\n"
         f"⏱ <b>Duration:</b> ~{int(round(order['duration_min']))} min\n"
@@ -321,17 +322,17 @@ def render_order_text(order: dict) -> str:
         f"🆕 <b>TezGo buyurtma</b> — <code>{order['order_id']}</code>",
         f"Holat: <b>{STATUS_LABELS.get(order.get('status', 'pending'))}</b>",
         "",
-        f"👤 Mijoz: {order['customer_name']}",
-        f"📍 <b>Qayerdan:</b> {order['pickup']['address']}",
+        f"👤 Mijoz: {he(order['customer_name'])}",
+        f"📍 <b>Qayerdan:</b> {he(order['pickup']['address'])}",
         f"   <a href=\"{maps_link(order['pickup']['lat'], order['pickup']['lon'])}\">Xaritada ochish</a>",
-        f"🏁 <b>Qayerga:</b> {order['destination']['address']}",
+        f"🏁 <b>Qayerga:</b> {he(order['destination']['address'])}",
         f"   <a href=\"{maps_link(order['destination']['lat'], order['destination']['lon'])}\">Xaritada ochish</a>",
         f"🚘 Sinf: {class_label}",
         f"📏 {order['distance_km']:.1f} km · ⏱ ~{int(round(order['duration_min']))} daq",
         f"💰 Narx: {format_som(order['fare_som'])} so'm",
     ]
     if order.get("driver_name"):
-        lines.append(f"\n🧑‍✈️ Haydovchi: <b>{order['driver_name']}</b>")
+        lines.append(f"\n🧑‍✈️ Haydovchi: <b>{he(order['driver_name'])}</b>")
     return "\n".join(lines)
 
 
@@ -436,7 +437,7 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await notify_customer(
         context, order,
         f"🟢 Buyurtmangiz <code>{order_id}</code> qabul qilindi!\n"
-        f"Haydovchi: <b>{order['driver_name']}</b> tez orada bog'lanadi.",
+        f"Haydovchi: <b>{he(order['driver_name'])}</b> tez orada bog'lanadi.",
     )
 
 
@@ -462,9 +463,9 @@ async def stage_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await refresh_group_message(context, order)
 
     if stage == "enroute":
-        await notify_customer(context, order, f"🚗 Haydovchi <b>{order['driver_name']}</b> yo'lda — sizga kelmoqda.")
+        await notify_customer(context, order, f"🚗 Haydovchi <b>{he(order['driver_name'])}</b> yo'lda — sizga kelmoqda.")
     elif stage == "arrived":
-        await notify_customer(context, order, f"📍 Haydovchi <b>{order['driver_name']}</b> yetib keldi. Iltimos, chiqing.")
+        await notify_customer(context, order, f"📍 Haydovchi <b>{he(order['driver_name'])}</b> yetib keldi. Iltimos, chiqing.")
     elif stage == "completed":
         stats = context.bot_data.get("driver_stats", {}).get(driver.id)
         if stats:
@@ -477,7 +478,7 @@ async def stage_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await context.bot.send_message(
                     chat_id=cid,
                     text=(f"✅ Safar yakunlandi. Rahmat!\n"
-                          f"Haydovchi <b>{order['driver_name']}</b>ni baholang:"),
+                          f"Haydovchi <b>{he(order['driver_name'])}</b>ni baholang:"),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(rate_rows),
                 )
@@ -555,7 +556,7 @@ async def rate_driver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await context.bot.send_message(
                 chat_id=DRIVERS_CHAT_ID,
-                text=(f"⭐ <code>{order_id}</code> — {order.get('driver_name') or ''} "
+                text=(f"⭐ <code>{order_id}</code> — {he(order.get('driver_name') or '')} "
                       f"baholandi: {n}/5 (o'rtacha {avg:.1f})"),
                 parse_mode=ParseMode.HTML,
             )
@@ -574,7 +575,7 @@ async def drivers_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         r = s["ratings"]
         avg = f"{sum(r) / len(r):.1f}⭐" if r else "—"
         lines.append(
-            f"{s['name']}: ✅ {s['completed']} · qabul {s['accepted']} · bekor {s['cancelled']} · {avg}"
+            f"{he(s['name'])}: ✅ {s['completed']} · qabul {s['accepted']} · bekor {s['cancelled']} · {avg}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
